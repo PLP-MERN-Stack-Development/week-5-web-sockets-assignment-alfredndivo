@@ -1,132 +1,139 @@
-// server.js - Main server file for Socket.io chat application
+// server.js
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const mongoose = require('mongoose');
+const cookieParser = require('cookie-parser');
+const jwt = require('jsonwebtoken');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const morgan = require('morgan');
 const path = require('path');
 
-// Load environment variables
 dotenv.config();
 
-// Initialize Express app
+const verifyToken = require('./middleware/authMiddleware');
+const Message = require('./models/Message');
+const authRouter = require('./routes/auth');
+
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'chat_secret';
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => console.log('✅ MongoDB connected'))
+.catch((err) => console.error('❌ MongoDB error:', err));
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+  cors: { origin: CLIENT_URL, methods: ['GET', 'POST'], credentials: true },
 });
 
-// Middleware
-app.use(cors());
+app.use(cors({ origin: CLIENT_URL, credentials: true }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(cookieParser());
+app.use(helmet());
+app.use(morgan('dev'));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(rateLimit({ windowMs: 60 * 1000, max: 100 }));
 
-// Store connected users and messages
-const users = {};
-const messages = [];
+const upload = multer({ dest: path.join(__dirname, 'uploads') });
+
+// SOCKET AUTH
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('No token'));
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.user = decoded;
+    return next();
+  } catch {
+    return next(new Error('Invalid token'));
+  }
+});
+
+const onlineUsers = {};
 const typingUsers = {};
 
-// Socket.io connection handler
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  const { id, username } = socket.user;
+  onlineUsers[socket.id] = { id, username };
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
-  });
+  io.emit('user_list', Object.values(onlineUsers));
+  io.emit('user_joined', { id: socket.id, username });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
+  socket.on('join_room', (room) => socket.join(room));
+
+  socket.on('send_message', async ({ text, room = 'global', isPrivate = false, to, fileUrl }) => {
+    const msg = await Message.create({
+      text,
+      room,
+      sender: username,
       senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
-  });
-
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+      isPrivate,
+      fileUrl,
+    });
+    if (isPrivate && to) {
+      socket.to(to).emit('private_message', msg);
+      socket.emit('private_message', msg);
+    } else {
+      io.to(room).emit('receive_message', msg);
     }
   });
 
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-    };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+  socket.on('typing', ({ room = 'global', isTyping }) => {
+    if (isTyping) typingUsers[socket.id] = username;
+    else delete typingUsers[socket.id];
+    io.to(room).emit('typing_users', Object.values(typingUsers));
   });
 
-  // Handle disconnection
+  socket.on('react_to_message', async ({ messageId, emoji }) => {
+    const message = await Message.findById(messageId);
+    if (!message) return;
+
+    if (!message.reactionsByUser) message.reactionsByUser = new Map();
+
+    message.reactionsByUser.set(socket.user.userId, emoji);
+
+    const counts = {};
+    for (let reaction of message.reactionsByUser.values()) {
+      counts[reaction] = (counts[reaction] || 0) + 1;
+    }
+
+    message.reactions = counts;
+    await message.save();
+
+    io.emit('message_reacted', { messageId, reactions: counts });
+  });
+
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
+    delete onlineUsers[socket.id];
     delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+    io.emit('user_left', { id: socket.id, username });
+    io.emit('user_list', Object.values(onlineUsers));
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
+// Routes
+app.use('/api', authRouter);
+
+app.get('/api/messages/:room', verifyToken, async (req, res) => {
+  const msgs = await Message.find({ room: req.params.room }).sort({ timestamp: 1 }).limit(100);
+  res.json(msgs);
 });
 
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
+app.post('/api/upload', verifyToken, upload.single('file'), (req, res) => {
+  res.json({ url: `/uploads/${req.file.filename}` });
 });
 
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
-});
+app.get('/', (req, res) => res.send('Chat server running'));
 
-// Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-module.exports = { app, server, io }; 
+server.listen(PORT, () => console.log(`🚀 Server listening on http://localhost:${PORT}`));
